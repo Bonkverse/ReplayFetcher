@@ -32,8 +32,19 @@
 // scraper and the cycle 5 migration already used.
 export const MAX_USERNAME_LENGTH = 100;
 
+// Postgres INT is 32-bit. bonk.io uses huge sentinel values in some fields
+// (e.g. a win limit of 1e308 for "no limit"), which Postgres rejects, so
+// anything outside the INT range is stored as null (unknown / unlimited).
+const INT_MAX = 2147483647;
 const finiteInt = (v) =>
-    typeof v === "number" && Number.isFinite(v) ? Math.trunc(v) : null;
+    typeof v === "number" && Number.isFinite(v) && Math.abs(v) <= INT_MAX
+        ? Math.trunc(v)
+        : null;
+// team is a SMALLINT column (-32768..32767)
+const smallInt = (v) => {
+    const n = finiteInt(v);
+    return n != null && Math.abs(n) <= 32767 ? n : null;
+};
 
 /**
  * Scores are the scoreboard as recorded when the replay starts (a bonk.io
@@ -61,7 +72,7 @@ export function extractParticipants(decoded) {
             username: p.userName,
             guest: !!p.guest,
             level: finiteInt(p.level) ?? 0,
-            team: finiteInt(p.team),
+            team: smallInt(p.team),
             ping: finiteInt(p.ping),
             // startingState.scores is indexed by slot in free-for-all but by
             // team number in team modes (red = 2, blue = 3, ...), so in team

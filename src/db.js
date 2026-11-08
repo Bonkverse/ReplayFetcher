@@ -187,6 +187,21 @@ export async function migrate() {
             last_id   BIGINT NOT NULL
         );
 
+        -- bonk.io account IDs (DBIDs) for registered names, sent by
+        -- bonkverse.io (which sees them in friend lists and logins) through
+        -- the replay site's POST /api/internal/player-ids. Written by the
+        -- replay site (ReplayRenderer server/sync-routes.mjs, which also
+        -- creates it if missing); declared here so the schema is in one place.
+        CREATE TABLE IF NOT EXISTS player_ids (
+            dbid        BIGINT      PRIMARY KEY,
+            username    TEXT        NOT NULL,
+            joined      DATE,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_player_ids_lower_username
+            ON player_ids (lower(username));
+
         CREATE TABLE IF NOT EXISTS backfill_state (
             name        TEXT        PRIMARY KEY,
             cycle       INT         NOT NULL,

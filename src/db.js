@@ -43,6 +43,27 @@ pool.on("error", (err) => {
  * scraper_state
  *   Single row (id = 1). Stores both position and cycle so restarts and
  *   redeploys always resume exactly where they left off.
+ *
+ * replay_participants PK = (cycle, replay_id, slot)
+ *   One row per player slot in each replay, with bonk.io's own `guest` flag.
+ *   This is the searchable "who played in this replay" index. It replaces
+ *   replay_players for search: that table keys on username (collapsing two
+ *   same-named players in one replay) and has no guest flag, and its FK to
+ *   players forced every guest name into the players identity table.
+ *   No FK to players: guests have no stable identity to point at.
+ *
+ * replay_meta PK = (cycle, replay_id)
+ *   Match-level fields (mode, teams, length, player counts) so result pages
+ *   can show and filter on them without decoding replays.
+ *
+ * players / replay_players
+ *   Registered accounts only from now on (see participants.js). Existing
+ *   guest rows from before this change are left in place; see
+ *   scripts/cleanup_guest_players.sql once the backfill has run.
+ *
+ * backfill_state
+ *   Cursor for backfill_participants.js, kept in Postgres (not a local file)
+ *   because Railway containers lose local files on every redeploy.
  */
 export async function migrate() {
 
@@ -114,6 +135,65 @@ export async function migrate() {
 
         CREATE INDEX IF NOT EXISTS idx_maps_mapid_version
             ON maps (mapid, version DESC);
+
+        CREATE TABLE IF NOT EXISTS replay_participants (
+            cycle      INT      NOT NULL,
+            replay_id  BIGINT   NOT NULL,
+            slot       SMALLINT NOT NULL,
+            username   TEXT     NOT NULL,
+            guest      BOOLEAN  NOT NULL,
+            level      INT      NOT NULL DEFAULT 0,
+            team       SMALLINT,
+            ping       INT,
+            score      INT,
+            PRIMARY KEY (cycle, replay_id, slot),
+            FOREIGN KEY (cycle, replay_id) REFERENCES replays(cycle, id) ON DELETE CASCADE
+        );
+
+        -- Exact, case-insensitive username lookups (registered players)
+        CREATE INDEX IF NOT EXISTS idx_rpart_lower_username
+            ON replay_participants (lower(username), cycle, replay_id);
+
+        -- Registered-only lookups by exact name (guests excluded)
+        CREATE INDEX IF NOT EXISTS idx_rpart_registered_username
+            ON replay_participants (username) WHERE NOT guest;
+
+        CREATE TABLE IF NOT EXISTS replay_meta (
+            cycle         INT      NOT NULL,
+            replay_id     BIGINT   NOT NULL,
+            mode          TEXT,
+            teams         BOOLEAN,
+            quickplay     BOOLEAN,
+            win_limit     INT,
+            rounds        INT,
+            frames        INT,
+            map_version   INT,
+            player_count  SMALLINT NOT NULL DEFAULT 0,
+            guest_count   SMALLINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (cycle, replay_id),
+            FOREIGN KEY (cycle, replay_id) REFERENCES replays(cycle, id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_replay_meta_mode
+            ON replay_meta (mode);
+
+        -- Approximate upload days for replays collected after the fact (the
+        -- cycle 5 import and cycle 6's first days). Filled by hand; read by
+        -- the replay site. Declared here so the schema is in one place.
+        CREATE TABLE IF NOT EXISTS replay_cycle_days (
+            cycle     INT    NOT NULL,
+            day       DATE   NOT NULL,
+            first_id  BIGINT NOT NULL,
+            last_id   BIGINT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS backfill_state (
+            name        TEXT        PRIMARY KEY,
+            cycle       INT         NOT NULL,
+            last_id     BIGINT      NOT NULL,
+            processed   BIGINT      NOT NULL DEFAULT 0,
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
     `);
 
     // Separate call: only works if pg_trgm actually installed above.
@@ -124,6 +204,16 @@ export async function migrate() {
         `);
     } catch (err) {
         console.warn("[DB] Could not create trigram index on maps.name (non-fatal):", err.message);
+    }
+
+    // Substring ("contains") username search on the replay site.
+    try {
+        await pool.query(`
+            CREATE INDEX IF NOT EXISTS idx_rpart_username_trgm
+                ON replay_participants USING gin (lower(username) gin_trgm_ops);
+        `);
+    } catch (err) {
+        console.warn("[DB] Could not create trigram index on replay_participants (non-fatal):", err.message);
     }
 
     console.log("[DB] Schema up-to-date.");
@@ -190,7 +280,9 @@ export async function beginNewCycle(currentCycle) {
  *   id: number,
  *   mapid: number|null,
  *   replayBytes: Buffer,
- *   players: Array<{username, level, avatar}>,
+ *   players: Array<{username, level, avatar}>,   // registered accounts only
+ *   participants: Array<{slot, username, guest, level, team, ping, score}>,
+ *   meta: object|null,                           // see participants.extractMatchMeta
  *   map: {
  *     mapid: number,
  *     version: number,
@@ -211,6 +303,8 @@ export async function insertBatch(cycle, docs) {
     const client = await pool.connect();
     try {
         await client.query("BEGIN");
+
+        const newlyInserted = [];
 
         for (const doc of docs) {
             const inserted = await client.query(
@@ -245,6 +339,8 @@ export async function insertBatch(cycle, docs) {
                     ]
                 );
             }
+
+            if (inserted.rowCount > 0) newlyInserted.push({ ...doc, cycle });
 
             for (const p of doc.players) {
                 if (!p.username) continue;
@@ -282,6 +378,8 @@ export async function insertBatch(cycle, docs) {
                 }
             }
         }
+
+        await writeParticipantsAndMeta(client, newlyInserted);
 
         await client.query("COMMIT");
     } catch (err) {
@@ -449,6 +547,11 @@ export async function insertBatchBulk(cycle, docs) {
             );
         }
 
+        await writeParticipantsAndMeta(
+            client,
+            insertedDocs.map((d) => ({ ...d, cycle }))
+        );
+
         await client.query("COMMIT");
         return { replaysInserted: insertedIds.size };
     } catch (err) {
@@ -457,6 +560,133 @@ export async function insertBatchBulk(cycle, docs) {
     } finally {
         client.release();
     }
+}
+
+// ─── Participants + match metadata ───────────────────────────────────────────
+
+/**
+ * Writes replay_participants and replay_meta rows for the given docs inside
+ * the caller's transaction. Two multi-row UNNEST inserts regardless of batch
+ * size. ON CONFLICT DO NOTHING makes it safe to re-run (backfill restarts,
+ * scraper retries).
+ *
+ * @param {import("pg").PoolClient} client
+ * @param {Array<{cycle: number, id: number, participants?: Array, meta?: object|null}>} docs
+ */
+async function writeParticipantsAndMeta(client, docs) {
+    const c = [], r = [], slot = [], name = [], guest = [], level = [], team = [], ping = [], score = [];
+    for (const d of docs) {
+        for (const p of d.participants ?? []) {
+            c.push(d.cycle);
+            r.push(d.id);
+            slot.push(p.slot);
+            name.push(p.username);
+            guest.push(!!p.guest);
+            level.push(p.level ?? 0);
+            team.push(p.team ?? null);
+            ping.push(p.ping ?? null);
+            score.push(p.score ?? null);
+        }
+    }
+
+    if (name.length > 0) {
+        await client.query(
+            `INSERT INTO replay_participants
+                (cycle, replay_id, slot, username, guest, level, team, ping, score)
+             SELECT * FROM UNNEST(
+                 $1::int[], $2::bigint[], $3::smallint[], $4::text[], $5::boolean[],
+                 $6::int[], $7::smallint[], $8::int[], $9::int[]
+             )
+             ON CONFLICT (cycle, replay_id, slot) DO NOTHING`,
+            [c, r, slot, name, guest, level, team, ping, score]
+        );
+    }
+
+    const metaDocs = docs.filter((d) => d.meta);
+    if (metaDocs.length > 0) {
+        const m = metaDocs.map((d) => d.meta);
+        await client.query(
+            `INSERT INTO replay_meta
+                (cycle, replay_id, mode, teams, quickplay, win_limit, rounds,
+                 frames, map_version, player_count, guest_count)
+             SELECT * FROM UNNEST(
+                 $1::int[], $2::bigint[], $3::text[], $4::boolean[], $5::boolean[],
+                 $6::int[], $7::int[], $8::int[], $9::int[], $10::smallint[], $11::smallint[]
+             )
+             ON CONFLICT (cycle, replay_id) DO NOTHING`,
+            [
+                metaDocs.map((d) => d.cycle),
+                metaDocs.map((d) => d.id),
+                m.map((x) => x.mode ?? null),
+                m.map((x) => x.teams ?? null),
+                m.map((x) => x.quickplay ?? null),
+                m.map((x) => x.winLimit ?? null),
+                m.map((x) => x.rounds ?? null),
+                m.map((x) => x.frames ?? null),
+                m.map((x) => x.mapVersion ?? null),
+                m.map((x) => x.playerCount ?? 0),
+                m.map((x) => x.guestCount ?? 0),
+            ]
+        );
+    }
+}
+
+/**
+ * Backfill entry point: participants + meta for replays already in the
+ * replays table. One transaction per batch.
+ */
+export async function insertParticipantsBatch(docs) {
+    if (docs.length === 0) return;
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        await writeParticipantsAndMeta(client, docs);
+        await client.query("COMMIT");
+    } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+    } finally {
+        client.release();
+    }
+}
+
+/** Backfill cursor, stored in Postgres so it survives container restarts. */
+export async function getBackfillState(name) {
+    const res = await pool.query(
+        `SELECT cycle, last_id, processed FROM backfill_state WHERE name = $1`,
+        [name]
+    );
+    if (!res.rows.length) return null;
+    const row = res.rows[0];
+    return { cycle: row.cycle, lastId: Number(row.last_id), processed: Number(row.processed) };
+}
+
+export async function saveBackfillState(name, { cycle, lastId, processed }) {
+    await pool.query(
+        `INSERT INTO backfill_state (name, cycle, last_id, processed, updated_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (name) DO UPDATE SET
+             cycle = EXCLUDED.cycle, last_id = EXCLUDED.last_id,
+             processed = EXCLUDED.processed, updated_at = NOW()`,
+        [name, cycle, lastId, processed]
+    );
+}
+
+export async function clearBackfillState(name) {
+    await pool.query(`DELETE FROM backfill_state WHERE name = $1`, [name]);
+}
+
+/** Reads one page of replays after (cycle, id), in key order. */
+export async function readReplayPage(afterCycle, afterId, limit) {
+    const res = await pool.query(
+        `SELECT cycle, id, replaydata
+         FROM replays
+         WHERE (cycle, id) > ($1::int, $2::bigint)
+         ORDER BY cycle, id
+         LIMIT $3`,
+        [afterCycle, afterId, limit]
+    );
+    return res.rows.map((row) => ({ cycle: row.cycle, id: Number(row.id), replaydata: row.replaydata }));
 }
 
 // ─── Teardown ─────────────────────────────────────────────────────────────────

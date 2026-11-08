@@ -122,6 +122,41 @@ When Chaz wipes replays and a new cycle begins:
 
 ---
 
+## Players, guests and slots
+
+Each replay's players are stored in `replay_participants`, one row per slot
+(`cycle, replay_id, slot`), with bonk.io's own `guest` flag, level, team,
+ping and score. Match-level fields (mode, teams, length, player counts) are
+in `replay_meta`. The replay site searches these tables.
+
+Why: registered bonk.io usernames are unique and permanent, but guest names
+aren't (anyone can be a guest called "New Player"). The older
+`replay_players` table keys on username and has no guest flag, and its
+foreign key to `players` pushed every guest name into the `players` table as
+if it were an account. Now `players` and `replay_players` only receive
+registered accounts.
+
+Scores: `startingState.scores` is indexed by slot in free-for-all and by
+team number (red = 2, blue = 3, ...) in team modes.
+
+### Backfilling existing replays (one time)
+
+New replays get participants automatically. For everything collected before,
+run the backfill from the service shell (it decodes the stored replays, so
+nothing is re-fetched from bonk.io):
+
+```bash
+node src/backfill_participants.js --dry-run          # check a sample first
+nohup node src/backfill_participants.js > backfill.log 2>&1 &
+tail -f backfill.log
+```
+
+It saves its position in Postgres after every batch, so if it stops (closed
+console, redeploy), run the same command again to continue.
+
+Once it says `Done`, optionally remove old guest-only names from `players`
+with `scripts/cleanup_guest_players.sql` (it previews before deleting).
+
 ## Querying the data
 
 ```sql

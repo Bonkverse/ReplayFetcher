@@ -102,3 +102,14 @@ export async function encodeForStorage(rawdata) {
     const replayBytes = await compressForStorage(rawBuffer);
     return { replayBytes, decoded };
 }
+/**
+ * Inverse of encodeForStorage for rows already in the `replays` table:
+ * gzip'd PSON BYTEA → decoded JS object. Used by backfills.
+ */
+export async function decodeStoredReplay(blob) {
+    const pson = await gunzip(blob);
+    // Slice to the exact bytes: a small Buffer can be a view into Node's
+    // shared pool, so its .buffer may contain unrelated bytes around it.
+    const ab = pson.buffer.slice(pson.byteOffset, pson.byteOffset + pson.byteLength);
+    return pairs.decode(ab);
+}

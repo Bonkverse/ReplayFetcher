@@ -43,6 +43,7 @@
 import { MongoClient } from "mongodb";
 import { readFile, writeFile, unlink } from "node:fs/promises";
 import { migrate, insertBatchBulk, closeDb } from "./db.js";
+import { extractParticipants, extractMatchMeta, registeredPlayers } from "./participants.js";
 import { encodeForStorage, compressJsonForStorage } from "./codec.js";
 
 const MONGO_URL = process.env.MONGO_URL || "mongodb://127.0.0.1:27017";
@@ -89,33 +90,12 @@ async function processDoc(doc) {
   try {
     const { replayBytes, decoded } = await encodeForStorage(doc.replaydata);
 
-    // MAX_USERNAME_LENGTH is generous relative to bonk.io's real client-side
-    // limit (well under 24 chars) — it only needs to stay safely below
-    // Postgres's btree index row-size ceiling (~2704 bytes on an 8KB page).
-    // A corrupted decode can produce a "username" that's thousands of
-    // characters of garbage without decodeReplayData ever throwing, and an
-    // unguarded value like that crashes the whole batch's insert on
-    // players_pkey rather than just dropping the one bad row.
-    const MAX_USERNAME_LENGTH = 100;
-
-    const players = (decoded.playerArray ?? [])
-      .filter(Boolean)
-      .map((p) => ({
-        username: typeof p.userName === "string" ? p.userName : null,
-        level: Number.isFinite(p.level) ? p.level : 0,
-        avatar: p.avatar ?? null,
-      }))
-      .filter((p) => {
-        if (!p.username) return false;
-        if (p.username.length > MAX_USERNAME_LENGTH) {
-          console.warn(
-            `[Migrate] Dropping player with implausible username length ` +
-              `(${p.username.length} chars) on doc id=${doc.id}: "${p.username.slice(0, 40)}…"`
-          );
-          return false;
-        }
-        return true;
-      });
+    // Same extraction as the live scraper (participants.js): slot-based
+    // participants with the guest flag; registered players only for the
+    // players identity table.
+    const participants = extractParticipants(decoded);
+    const players = registeredPlayers(participants);
+    const meta = extractMatchMeta(decoded);
 
     const ss = decoded?.startingState ?? {};
     const mm = ss.mm ?? {};
@@ -152,6 +132,8 @@ async function processDoc(doc) {
       mapid,
       replayBytes,
       players,
+      participants,
+      meta,
       map,
     };
   } catch (e) {

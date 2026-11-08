@@ -270,7 +270,10 @@ const MODES = { b:"Classic", ar:"Arrows", ard:"Death Arrows", sp:"Grapple", v:"V
 
 function banner(kind, html){ const b=$("#banner"); b.className="banner show "+kind; b.innerHTML=html; }
 function clearBanner(){ $("#banner").className="banner"; }
-function escapeHtml(s){ return String(s).replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+// Escapes quotes too: player and map names come from replays, and some are
+// hostile (script-injection "usernames" exist in the archive). Names also
+// land inside attributes (title="..."), where an unescaped " breaks out.
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function fmt(n){ return Number(n).toLocaleString("en-US"); }
 function hexColor(n){ if(n==null||isNaN(n)) return "#334"; return "#"+(n&0xffffff).toString(16).padStart(6,"0"); }
 function safeName(s){ return String(s||"player").replace(/[^a-z0-9_-]+/gi,"_").slice(0,40); }

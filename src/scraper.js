@@ -1,6 +1,6 @@
 import { config }                                    from "../config.js";
 import { migrate, getState, saveState, beginNewCycle,
-         insertBatch, closeDb }                      from "./db.js";
+         insertBatch, closeDb, setScraperStatus }    from "./db.js";
 import { fetchReplays }                              from "./api.js";
 import { encodeForStorage, compressJsonForStorage } from "./codec.js";
 import { extractParticipants, extractMatchMeta,
@@ -80,6 +80,7 @@ export class Scraper {
         let { cycle, position } = await getState();
         let consecutiveFails    = 0;
         let wasCaughtUp         = false;
+        let runAdded            = 0;   // replays stored in the current fetch run
 
         console.log(`[Scraper] Resuming — cycle ${cycle}, position ${position}`);
 
@@ -98,7 +99,7 @@ export class Scraper {
                     `[Scraper] Network error (fail #${consecutiveFails}): ${result.error.message}` +
                     ` — retrying in ${wait / 1000}s`
                 );
-                await this.#sleepInterruptible(wait);
+                await this.#wait("retrying", wait);
                 continue;
             }
 
@@ -107,7 +108,7 @@ export class Scraper {
                 console.warn(
                     `[Scraper] Rate-limited — waiting ${config.delays.rateLimit / 60_000} min`
                 );
-                await this.#sleepInterruptible(config.delays.rateLimit);
+                await this.#wait("rate_limited", config.delays.rateLimit);
                 continue;
             }
 
@@ -120,7 +121,11 @@ export class Scraper {
                     );
                 }
                 wasCaughtUp = true;
-                await this.#sleepInterruptible(config.delays.caughtUp);
+                // A fetch run just ended: record how many replays it added
+                // (the replay site shows "N new replays added").
+                const finishedRun = runAdded > 0 ? { added: runAdded } : null;
+                runAdded = 0;
+                await this.#wait("caught_up", config.delays.caughtUp, finishedRun);
                 continue;
             }
 
@@ -202,7 +207,7 @@ export class Scraper {
                 await insertBatch(cycle, docs);
             } catch (err) {
                 console.error("[Scraper] DB insert failed:", err.message);
-                await this.#sleepInterruptible(config.delays.initialBackoff);
+                await this.#wait("retrying", config.delays.initialBackoff);
                 continue;
             }
 
@@ -210,6 +215,7 @@ export class Scraper {
             // Always advance by the full batch size (including decode failures)
             // so a permanently corrupt replay never blocks progress.
             position += replays.length;
+            runAdded += docs.length;
             await saveState({ cycle, position });
 
             const invalid = replays.length - docs.length;
@@ -225,12 +231,18 @@ export class Scraper {
                 );
             }
 
-            await this.#sleepInterruptible(config.delays.between);
+            await this.#wait("fetching", config.delays.between);
         }
 
         console.log("[Scraper] Shutting down — closing DB…");
         await closeDb();
         console.log("[Scraper] Done.");
+    }
+
+    /** Records status + next fetch time for the replay site, then waits. */
+    async #wait(status, ms, finishedRun = null) {
+        await setScraperStatus(status, ms, finishedRun);
+        return this.#sleepInterruptible(ms);
     }
 
     #sleepInterruptible(ms) {

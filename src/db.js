@@ -196,6 +196,17 @@ export async function migrate() {
         );
     `);
 
+    // Live status for the replay site (countdown to the next fetch, "N new
+    // replays added"). Columns added to the existing single-row state table.
+    await pool.query(`
+        ALTER TABLE scraper_state
+            ADD COLUMN IF NOT EXISTS status          TEXT,
+            ADD COLUMN IF NOT EXISTS next_fetch_at   TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS status_at       TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS last_run_added  INT,
+            ADD COLUMN IF NOT EXISTS last_run_at     TIMESTAMPTZ;
+    `);
+
     // Separate call: only works if pg_trgm actually installed above.
     try {
         await pool.query(`
@@ -265,6 +276,34 @@ export async function beginNewCycle(currentCycle) {
     );
     console.log(`[DB] Cycle transition: ${currentCycle} → ${newCycle}`);
     return { cycle: newCycle, position: 1 };
+}
+
+// ─── Live status ────────────────────────────────────────────────────────────
+
+/**
+ * Records what the scraper is doing and when it will next ask bonk.io for
+ * replays, so the replay site can show a countdown. Called right before
+ * every wait. Never throws: a status write must not stop the scraper.
+ *
+ * @param {"caught_up"|"fetching"|"rate_limited"|"retrying"} status
+ * @param {number} waitMs  how long until the next fetch
+ * @param {{ added: number }|null} finishedRun  set when a fetch run ends
+ */
+export async function setScraperStatus(status, waitMs, finishedRun = null) {
+    try {
+        await pool.query(
+            `UPDATE scraper_state SET
+                 status         = $1,
+                 next_fetch_at  = NOW() + ($2::int * INTERVAL '1 millisecond'),
+                 status_at      = NOW(),
+                 last_run_added = COALESCE($3, last_run_added),
+                 last_run_at    = CASE WHEN $3::int IS NULL THEN last_run_at ELSE NOW() END
+             WHERE id = 1`,
+            [status, Math.round(waitMs), finishedRun ? finishedRun.added : null]
+        );
+    } catch (err) {
+        console.warn("[DB] Could not record scraper status (non-fatal):", err.message);
+    }
 }
 
 // ─── Replays ─────────────────────────────────────────────────────────────────

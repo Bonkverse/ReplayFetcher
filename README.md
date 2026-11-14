@@ -23,7 +23,9 @@ bonk2.io API  ──fetch──►  api.js        (HTTP, typed result union)
 | Field | Type | Notes |
 |-------|------|-------|
 | `replays.replaydata` | `BYTEA` | Raw PSON binary, gzip-compressed |
-| `players.avatars` | `JSONB` | Append-only set, queryable |
+| `players.avatars` | `JSONB` | Append-only set, queryable (no order: use `avatars` below for "which skin, when") |
+| `avatars` | `hash` → `JSONB` | Each distinct skin once, keyed by a hash ([Skins](#skins)) |
+| `replay_participants.avatar_hash` | `TEXT` | The skin that player wore in that replay |
 | `replay_players` | join table | Many-to-many, indexed on `username` |
 | `scraper_state.position` | `BIGINT` | Survives restarts/redeploys |
 
@@ -157,6 +159,42 @@ console, redeploy), run the same command again to continue.
 Once it says `Done`, optionally remove old guest-only names from `players`
 with `scripts/cleanup_guest_players.sql` (it previews before deleting).
 
+## Skins
+
+The skin each participant wore is in the replay itself
+(`playerArray[i].avatar`, `{ layers: [...], bc }`). `src/avatars.js`
+normalizes it (known fields only, empty layer slots kept) and hashes a
+canonical JSON form; `avatars` stores each distinct skin once and
+`replay_participants.avatar_hash` points at it. A few hundred thousand skins
+instead of a copy in every one of millions of participant rows.
+
+A player's latest skin is the one on their newest participant row:
+
+```sql
+SELECT a.avatar, rp.cycle, rp.replay_id
+FROM replay_participants rp
+JOIN avatars a ON a.hash = rp.avatar_hash
+WHERE lower(rp.username) = lower('SomePlayer') AND NOT rp.guest
+ORDER BY rp.cycle DESC, rp.replay_id DESC
+LIMIT 1;
+```
+
+(`idx_rpart_lower_username` covers it.) New replays get `avatar_hash`
+automatically. For replays stored before, run the backfill from the service
+shell once (decodes stored replays, nothing re-fetched; resumable like the
+participants backfill, cursor `avatars_v1`):
+
+```bash
+node src/backfill_avatars.js --dry-run              # check a sample first
+nohup node src/backfill_avatars.js > backfill_avatars.log 2>&1 &
+tail -f backfill_avatars.log
+```
+
+Don't change `normalizeAvatar()` or `canonicalJson()` casually: the hash of
+every stored skin depends on them.
+
+`npm test` runs the unit tests (`test/`, no database needed).
+
 ## Querying the data
 
 ```sql
@@ -189,6 +227,10 @@ src/
   api.js       bonk.io HTTP client, typed result union
   codec.js     LZString/PSON decode + gzip compress/decompress
   db.js        Postgres pool, migrations, batch upsert
+  participants.js  Per-slot players and match metadata from a decoded replay
+  avatars.js   Skin form and hash (see Skins)
+  backfill_*.js    One-time backfills over stored replays
+test/          node --test unit tests
 config.js      All constants and env-var reads
 railway.toml   Railway build/deploy config
 .env.example   Required environment variables

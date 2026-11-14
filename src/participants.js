@@ -24,7 +24,15 @@
  * contaminate a registered account's history. Each playerArray entry has an
  * explicit `guest` boolean, so we store it instead of guessing (level 0 is
  * a strong hint but the flag is the source of truth).
+ *
+ * Skins
+ * ─────
+ * Each participant also carries the skin worn in that replay, normalized and
+ * hashed by avatars.js (`avatarHash`, `avatarJson`); db.js stores it once in
+ * `avatars` and points the participant row at it.
  */
+
+import { canonicalJson, hashedAvatar } from "./avatars.js";
 
 // Generous relative to bonk.io's real client-side name limit. A corrupted
 // decode can produce a "username" thousands of characters long without the
@@ -54,7 +62,7 @@ const smallInt = (v) => {
  * @returns {Array<{
  *   slot: number, username: string, guest: boolean, level: number,
  *   team: number|null, ping: number|null, score: number|null,
- *   avatar: object|null
+ *   avatar: object|null, avatarHash: string|null, avatarJson: string|null
  * }>}
  */
 export function extractParticipants(decoded) {
@@ -66,6 +74,7 @@ export function extractParticipants(decoded) {
     arr.forEach((p, slot) => {
         if (!p || typeof p.userName !== "string" || p.userName.length === 0) return;
         if (p.userName.length > MAX_USERNAME_LENGTH) return;
+        const skin = hashedAvatar(p.avatar);
 
         out.push({
             slot,
@@ -83,6 +92,8 @@ export function extractParticipants(decoded) {
                     ? finiteInt(scores[p.team])
                     : finiteInt(scores[slot]),
             avatar: p.avatar ?? null,
+            avatarHash: skin ? skin.hash : null,
+            avatarJson: skin ? canonicalJson(skin.avatar) : null,
         });
     });
 

@@ -1,5 +1,6 @@
 import pg from "pg";
 import { config } from "../config.js";
+import { distinctAvatars } from "./avatars.js";
 
 // ─── Pool ─────────────────────────────────────────────────────────────────────
 
@@ -62,8 +63,18 @@ pool.on("error", (err) => {
  *   scripts/cleanup_guest_players.sql once the backfill has run.
  *
  * backfill_state
- *   Cursor for backfill_participants.js, kept in Postgres (not a local file)
- *   because Railway containers lose local files on every redeploy.
+ *   Cursor for backfill_participants.js and backfill_avatars.js, kept in
+ *   Postgres (not a local file) because Railway containers lose local files
+ *   on every redeploy.
+ *
+ * avatars PK = hash, replay_participants.avatar_hash
+ *   The skin each participant wore in that replay, stored once per distinct
+ *   skin (see avatars.js for the form and the hash). A player's latest skin
+ *   is the avatar_hash of their newest participant row. No FK from
+ *   avatar_hash: avatars are inserted first in the same transaction, and a
+ *   FK would add a lookup to every one of millions of rows for no gain.
+ *   Unlike players.avatars (an unordered set), this says which skin was
+ *   worn when.
  */
 export async function migrate() {
 
@@ -194,6 +205,20 @@ export async function migrate() {
             processed   BIGINT      NOT NULL DEFAULT 0,
             updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+    `);
+
+    // The skin each participant wore (see the migrate() doc comment). Added
+    // to the existing table: NULL until written by the scraper or
+    // backfill_avatars.js, and for participants whose replay had no avatar.
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS avatars (
+            hash           TEXT        PRIMARY KEY,
+            avatar         JSONB       NOT NULL,
+            first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        ALTER TABLE replay_participants
+            ADD COLUMN IF NOT EXISTS avatar_hash TEXT;
     `);
 
     // Live status for the replay site (countdown to the next fetch, "N new
@@ -613,7 +638,11 @@ export async function insertBatchBulk(cycle, docs) {
  * @param {Array<{cycle: number, id: number, participants?: Array, meta?: object|null}>} docs
  */
 async function writeParticipantsAndMeta(client, docs) {
-    const c = [], r = [], slot = [], name = [], guest = [], level = [], team = [], ping = [], score = [];
+    // Skins first, so every avatar_hash below points at a stored avatar.
+    await writeAvatars(client, docs.flatMap((d) => d.participants ?? []));
+
+    const c = [], r = [], slot = [], name = [], guest = [], level = [], team = [], ping = [], score = [],
+        avatarHash = [];
     for (const d of docs) {
         for (const p of d.participants ?? []) {
             c.push(d.cycle);
@@ -625,19 +654,20 @@ async function writeParticipantsAndMeta(client, docs) {
             team.push(p.team ?? null);
             ping.push(p.ping ?? null);
             score.push(p.score ?? null);
+            avatarHash.push(p.avatarHash ?? null);
         }
     }
 
     if (name.length > 0) {
         await client.query(
             `INSERT INTO replay_participants
-                (cycle, replay_id, slot, username, guest, level, team, ping, score)
+                (cycle, replay_id, slot, username, guest, level, team, ping, score, avatar_hash)
              SELECT * FROM UNNEST(
                  $1::int[], $2::bigint[], $3::smallint[], $4::text[], $5::boolean[],
-                 $6::int[], $7::smallint[], $8::int[], $9::int[]
+                 $6::int[], $7::smallint[], $8::int[], $9::int[], $10::text[]
              )
              ON CONFLICT (cycle, replay_id, slot) DO NOTHING`,
-            [c, r, slot, name, guest, level, team, ping, score]
+            [c, r, slot, name, guest, level, team, ping, score, avatarHash]
         );
     }
 
@@ -667,6 +697,68 @@ async function writeParticipantsAndMeta(client, docs) {
                 m.map((x) => x.guestCount ?? 0),
             ]
         );
+    }
+}
+
+/**
+ * Inserts the distinct avatars among `participants` (avatars.js), skipping
+ * ones already stored. One statement per batch.
+ */
+async function writeAvatars(client, participants) {
+    const { hashes, json } = distinctAvatars(participants);
+    if (hashes.length === 0) return;
+    // Sorted so concurrent writers (scraper + backfill) take row locks in the
+    // same order and can't deadlock on the same new avatars.
+    const order = hashes.map((_, i) => i).sort((a, b) => (hashes[a] < hashes[b] ? -1 : 1));
+    await client.query(
+        `INSERT INTO avatars (hash, avatar)
+         SELECT * FROM UNNEST($1::text[], $2::jsonb[])
+         ON CONFLICT (hash) DO NOTHING`,
+        [order.map((i) => hashes[i]), order.map((i) => json[i])]
+    );
+}
+
+/**
+ * Backfill entry point for backfill_avatars.js: stores the avatars of these
+ * replays' participants and sets avatar_hash on participant rows that don't
+ * have one yet. Rows written by the scraper already have it and are left
+ * alone. One transaction per batch.
+ *
+ * @param {Array<{cycle: number, id: number, participants: Array}>} docs
+ * @returns {Promise<number>} participant rows updated
+ */
+export async function setParticipantAvatars(docs) {
+    const rows = docs.flatMap((d) =>
+        (d.participants ?? [])
+            .filter((p) => p.avatarHash)
+            .map((p) => ({ cycle: d.cycle, id: d.id, slot: p.slot, hash: p.avatarHash, p }))
+    );
+    if (rows.length === 0) return 0;
+    const client = await pool.connect();
+    try {
+        await client.query("BEGIN");
+        await writeAvatars(client, rows.map((x) => x.p));
+        const res = await client.query(
+            `UPDATE replay_participants AS rp
+             SET avatar_hash = v.hash
+             FROM UNNEST($1::int[], $2::bigint[], $3::smallint[], $4::text[])
+                 AS v(cycle, replay_id, slot, hash)
+             WHERE rp.cycle = v.cycle AND rp.replay_id = v.replay_id
+               AND rp.slot = v.slot AND rp.avatar_hash IS NULL`,
+            [
+                rows.map((x) => x.cycle),
+                rows.map((x) => x.id),
+                rows.map((x) => x.slot),
+                rows.map((x) => x.hash),
+            ]
+        );
+        await client.query("COMMIT");
+        return res.rowCount;
+    } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+    } finally {
+        client.release();
     }
 }
 

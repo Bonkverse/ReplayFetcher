@@ -2,9 +2,7 @@ import { config }                                    from "../config.js";
 import { migrate, getState, saveState, beginNewCycle,
          insertBatch, closeDb, setScraperStatus }    from "./db.js";
 import { fetchReplays }                              from "./api.js";
-import { encodeForStorage, compressJsonForStorage } from "./codec.js";
-import { extractParticipants, extractMatchMeta,
-         registeredPlayers }                         from "./participants.js";
+import { buildReplayDoc }                          from "./replayDoc.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -153,48 +151,7 @@ export class Scraper {
             await Promise.all(
                 replays.map(async (r) => {
                     try {
-                        const { replayBytes, decoded } = await encodeForStorage(r.replaydata);
-
-                        // Slot-based participants with bonk.io's guest flag
-                        // (see participants.js for why). `players` feeds the
-                        // cross-replay identity table, so registered only.
-                        const participants = extractParticipants(decoded);
-                        const players = registeredPlayers(participants);
-                        const meta = extractMatchMeta(decoded);
-
-                        // Pull map metadata + geometry, matching output.json's confirmed shape
-                        const ss = decoded?.startingState ?? {};
-                        const mm = ss.mm ?? {};
-
-                        let map = null;
-                        if (Number.isFinite(mm.dbid) && Number.isFinite(mm.dbv)) {
-                            const mapBytes = await compressJsonForStorage({
-                                physics:  ss.physics ?? null,
-                                capZones: ss.capZones ?? null,
-                            });
-                            map = {
-                                mapid:     mm.dbid,
-                                version:   mm.dbv,
-                                name:      mm.n ?? decoded.mn ?? null,
-                                author:    mm.a ?? decoded.ma ?? null,
-                                authorId:  Number.isFinite(mm.authid) ? mm.authid : null,
-                                published: typeof mm.pub === "boolean" ? mm.pub : null,
-                                votesUp:   Number.isFinite(mm.vu) ? mm.vu : null,
-                                votesDown: Number.isFinite(mm.vd) ? mm.vd : null,
-                                remixOf:   Number.isFinite(mm.rxid) && mm.rxid > 0 ? mm.rxid : null,
-                                mapBytes,
-                            };
-                        }
-
-                        docs.push({
-                            id: r.id,
-                            mapid: r.mapid ?? null,
-                            replayBytes,
-                            players,
-                            participants,
-                            meta,
-                            map,
-                        });
+                        docs.push(await buildReplayDoc(r));
                     } catch (e) {
                         failedIds.push(r.id);
                         console.warn(`[Scraper] Decode failed for replay ${r.id}: ${e.message}`);

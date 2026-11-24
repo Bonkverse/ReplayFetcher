@@ -1,0 +1,278 @@
+// Gap report: which replay IDs are missing from a cycle, when the gaps
+// happened, and (optionally) whether bonk.io still has them.
+//
+//   DATABASE_URL=<Replay DB public URL> node scripts/gap_report.js [options]
+//
+// Options
+//   --cycle N      cycle to check (default: the scraper's current cycle)
+//   --min N        a gap is "big" when at least N IDs in a row are missing (default 10)
+//   --top N        how many big gaps to list (default 40)
+//   --csv FILE     also write every gap (any size) to a CSV file
+//   --probe N      ask bonk.io about the N biggest gaps plus N random small
+//                  ones: are those IDs still there? (one request every 4 s)
+//   --recover      for gaps bonk.io still has, fetch and store the replays
+//                  (same decoding and insert as the scraper). Implies probing.
+//
+// Read-only unless --recover is given. Probing uses bonk.io's replay API from
+// the machine you run this on, so it doesn't use up the scraper's rate limit.
+
+import pg from "pg";
+import { writeFileSync } from "node:fs";
+import { fetchReplays } from "../src/api.js";
+import { buildReplayDoc } from "../src/replayDoc.js";
+import { insertBatch, closeDb } from "../src/db.js";
+
+// ─── Args ────────────────────────────────────────────────────────────────────
+
+const args = process.argv.slice(2);
+const opt = (name, fallback) => {
+    const i = args.indexOf(`--${name}`);
+    if (i === -1) return fallback;
+    const v = args[i + 1];
+    return v === undefined || v.startsWith("--") ? true : v;
+};
+const MIN_BIG = parseInt(opt("min", "10"), 10);
+const TOP = parseInt(opt("top", "40"), 10);
+const CSV = opt("csv", null);
+const RECOVER = opt("recover", false) === true;
+const PROBE = RECOVER ? parseInt(opt("probe", "1000000"), 10) || 1_000_000 : parseInt(opt("probe", "0"), 10) || 0;
+const REQUEST_GAP_MS = 4_000;
+
+if (!process.env.DATABASE_URL) {
+    console.error("Set DATABASE_URL to the Replay DB's public URL (Railway → Replay DB → Variables → DATABASE_PUBLIC_URL).");
+    process.exit(1);
+}
+
+const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL, max: 2 });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── Formatting ──────────────────────────────────────────────────────────────
+
+const ET = "America/New_York";
+const fmtTime = (d) =>
+    d ? new Date(d).toLocaleString("en-US", { timeZone: ET, month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
+const fmtMins = (m) => (m == null ? "—" : m < 90 ? `${Math.round(m)} min` : `${(m / 60).toFixed(1)} h`);
+const n = (x) => Number(x).toLocaleString("en-US");
+
+function table(rows, cols) {
+    const widths = cols.map((c) => Math.max(c.label.length, ...rows.map((r) => String(c.get(r)).length)));
+    const line = (vals) => vals.map((v, i) => String(v).padStart(widths[i])).join("  ");
+    console.log(line(cols.map((c) => c.label)));
+    for (const r of rows) console.log(line(cols.map((c) => c.get(r))));
+}
+
+/**
+ * Best guess at why a gap happened, from when its neighbours were fetched.
+ * `fetched_at` is when the scraper stored a replay, not when it was uploaded.
+ */
+function likelyCause(g) {
+    const m = g.mins_between;
+    if (m == null) return "";
+    if (m >= 55) return "scraper paused or down (rate limit / outage / deploy)";
+    if (m <= 3) return "bonk.io didn't return these IDs (fetched in one go)";
+    return "skipped near the newest replays";
+}
+
+// ─── Queries ─────────────────────────────────────────────────────────────────
+
+// Every run of missing IDs between two stored replays, with when the replay
+// on each side was fetched.
+const GAPS_SQL = `
+    WITH r AS (
+        SELECT id, fetched_at,
+               LEAD(id)         OVER (ORDER BY id) AS next_id,
+               LEAD(fetched_at) OVER (ORDER BY id) AS next_fetched
+        FROM replays WHERE cycle = $1
+    )
+    SELECT id + 1 AS gap_start, next_id - 1 AS gap_end, next_id - id - 1 AS missing,
+           fetched_at AS before_fetched, next_fetched AS after_fetched,
+           EXTRACT(EPOCH FROM (next_fetched - fetched_at)) / 60 AS mins_between
+    FROM r WHERE next_id - id > 1
+    ORDER BY id`;
+
+async function main() {
+    let cycle = opt("cycle", null);
+    if (cycle === null) {
+        const st = await pool.query("SELECT cycle FROM scraper_state WHERE id = 1");
+        cycle = st.rows[0]?.cycle ?? 6;
+    }
+    cycle = parseInt(cycle, 10);
+
+    const sum = (await pool.query(
+        `SELECT COUNT(*)::bigint AS stored, MIN(id) AS lo, MAX(id) AS hi,
+                MIN(fetched_at) AS first_fetch, MAX(fetched_at) AS last_fetch
+         FROM replays WHERE cycle = $1`, [cycle])).rows[0];
+    if (!Number(sum.stored)) {
+        console.log(`No replays stored for cycle ${cycle}.`);
+        return;
+    }
+
+    const gaps = (await pool.query(GAPS_SQL, [cycle])).rows.map((g) => ({
+        ...g,
+        gap_start: Number(g.gap_start), gap_end: Number(g.gap_end), missing: Number(g.missing),
+        mins_between: g.mins_between == null ? null : Number(g.mins_between),
+    }));
+
+    const span = Number(sum.hi) - Number(sum.lo) + 1;
+    const missingTotal = gaps.reduce((a, g) => a + g.missing, 0);
+    const leading = Number(sum.lo) - 1; // IDs before the first stored one
+
+    console.log(`\n=== Cycle ${cycle} ===`);
+    console.log(`Stored ${n(sum.stored)} replays, IDs ${n(sum.lo)}–${n(sum.hi)} (${n(span)} IDs).`);
+    console.log(`Missing ${n(missingTotal)} IDs in ${n(gaps.length)} gaps → ${(100 * Number(sum.stored) / span).toFixed(1)}% coverage.`);
+    if (leading > 0) console.log(`Also missing IDs 1–${n(leading)} before the first stored replay.`);
+    console.log(`Fetched ${fmtTime(sum.first_fetch)} → ${fmtTime(sum.last_fetch)} (Eastern).`);
+
+    // ── Gap size histogram: what's "normal" ─────────────────────────────────
+    const buckets = [[1, 1], [2, 2], [3, 5], [6, 9], [10, 49], [50, 199], [200, 999], [1000, Infinity]];
+    console.log(`\n--- Gap sizes ---`);
+    table(
+        buckets.map(([lo, hi]) => {
+            const gs = gaps.filter((g) => g.missing >= lo && g.missing <= hi);
+            const ids = gs.reduce((a, g) => a + g.missing, 0);
+            return { label: hi === Infinity ? `${n(lo)}+` : lo === hi ? `${lo}` : `${lo}–${hi}`, gaps: gs.length, ids, share: missingTotal ? ((100 * ids) / missingTotal).toFixed(1) + "%" : "—" };
+        }),
+        [
+            { label: "missing in a row", get: (r) => r.label },
+            { label: "gaps", get: (r) => n(r.gaps) },
+            { label: "IDs missing", get: (r) => n(r.ids) },
+            { label: "% of missing", get: (r) => r.share },
+        ]
+    );
+
+    // ── Per day: where the losses are ───────────────────────────────────────
+    const days = (await pool.query(
+        `SELECT (fetched_at AT TIME ZONE '${ET}')::date AS d, COUNT(*)::int AS stored,
+                MIN(id) AS lo, MAX(id) AS hi
+         FROM replays WHERE cycle = $1 GROUP BY 1 ORDER BY 1`, [cycle])).rows;
+    console.log(`\n--- Per day (by fetch date, Eastern) ---`);
+    table(
+        days.map((d) => {
+            const s = Number(d.hi) - Number(d.lo) + 1;
+            return { d: d.d.toISOString().slice(0, 10), stored: d.stored, span: s, cov: ((100 * d.stored) / s).toFixed(1) + "%" };
+        }),
+        [
+            { label: "day", get: (r) => r.d },
+            { label: "stored", get: (r) => n(r.stored) },
+            { label: "ID span", get: (r) => n(r.span) },
+            { label: "coverage", get: (r) => r.cov },
+        ]
+    );
+    console.log("(Bulk-fetch days overlap other days' ID ranges, so read coverage there loosely.)");
+
+    // ── Cause of the missing IDs ────────────────────────────────────────────
+    const byCause = {};
+    for (const g of gaps) {
+        const c = likelyCause(g) || "unknown";
+        byCause[c] ??= { gaps: 0, ids: 0 };
+        byCause[c].gaps++; byCause[c].ids += g.missing;
+    }
+    console.log(`\n--- Likely cause (from fetch times either side of each gap) ---`);
+    table(
+        Object.entries(byCause).sort((a, b) => b[1].ids - a[1].ids).map(([c, v]) => ({ c, ...v })),
+        [
+            { label: "cause", get: (r) => r.c },
+            { label: "gaps", get: (r) => n(r.gaps) },
+            { label: "IDs", get: (r) => n(r.ids) },
+        ]
+    );
+
+    // ── Big gaps ────────────────────────────────────────────────────────────
+    const big = gaps.filter((g) => g.missing >= MIN_BIG).sort((a, b) => b.missing - a.missing);
+    console.log(`\n--- ${n(big.length)} gaps of ${MIN_BIG}+ IDs (${n(big.reduce((a, g) => a + g.missing, 0))} IDs); biggest ${Math.min(TOP, big.length)} ---`);
+    table(big.slice(0, TOP), [
+        { label: "first missing", get: (g) => g.gap_start },
+        { label: "last missing", get: (g) => g.gap_end },
+        { label: "missing", get: (g) => n(g.missing) },
+        { label: "fetched before", get: (g) => fmtTime(g.before_fetched) },
+        { label: "fetched after", get: (g) => fmtTime(g.after_fetched) },
+        { label: "time between", get: (g) => fmtMins(g.mins_between) },
+        { label: "likely cause", get: likelyCause },
+    ]);
+
+    if (CSV) {
+        const head = "gap_start,gap_end,missing,before_fetched,after_fetched,mins_between,likely_cause";
+        const lines = gaps.map((g) =>
+            [g.gap_start, g.gap_end, g.missing, g.before_fetched?.toISOString(), g.after_fetched?.toISOString(),
+             g.mins_between?.toFixed(1) ?? "", `"${likelyCause(g)}"`].join(","));
+        writeFileSync(CSV, [head, ...lines].join("\n") + "\n");
+        console.log(`\nWrote all ${n(gaps.length)} gaps to ${CSV}`);
+    }
+
+    if (PROBE > 0) await probeGaps(cycle, gaps, big);
+}
+
+// ─── Probe / recover ─────────────────────────────────────────────────────────
+
+/** One request to bonk.io, retried once after a network error. */
+async function ask(from) {
+    let res = await fetchReplays(from);
+    if (res.status === "network_error") { await sleep(10_000); res = await fetchReplays(from); }
+    await sleep(REQUEST_GAP_MS);
+    return res;
+}
+
+/**
+ * Walks one gap through bonk.io's API. Returns the replays bonk.io still has
+ * inside it. Stops early if bonk.io rate-limits us.
+ */
+async function walkGap(g, { all }) {
+    const found = [];
+    let from = g.gap_start;
+    while (from <= g.gap_end) {
+        const res = await ask(from);
+        if (res.status === "ratelimit") return { found, ratelimited: true, resumeFrom: from };
+        if (res.status !== "ok") break;
+        const ids = res.replays.map((r) => r.id);
+        found.push(...res.replays.filter((r) => r.id >= g.gap_start && r.id <= g.gap_end));
+        const max = Math.max(...ids);
+        if (!all || max > g.gap_end) break;          // a probe needs one request; past the gap
+        from = max + 1;
+    }
+    return { found, ratelimited: false };
+}
+
+async function probeGaps(cycle, gaps, big) {
+    // The biggest gaps, plus a random sample of small ones for comparison.
+    const small = gaps.filter((g) => g.missing < MIN_BIG);
+    const sample = [...small].sort(() => Math.random() - 0.5).slice(0, Math.min(PROBE, small.length));
+    const targets = RECOVER ? [...big, ...small] : [...big.slice(0, PROBE), ...sample];
+
+    console.log(`\n--- ${RECOVER ? "Recovering" : "Probing"} ${n(targets.length)} gaps on bonk.io (one request every ${REQUEST_GAP_MS / 1000}s) ---`);
+    if (RECOVER) console.log("This walks every gap; it can take a while. Ctrl-C is safe, rerun to continue.");
+
+    let stillThere = 0, gone = 0, recovered = 0;
+    for (const g of targets) {
+        const { found, ratelimited, resumeFrom } = await walkGap(g, { all: RECOVER });
+        if (found.length) {
+            stillThere++;
+            if (RECOVER) {
+                const docs = [];
+                for (const r of found) {
+                    try { docs.push(await buildReplayDoc(r)); }
+                    catch (e) { console.warn(`  decode failed for ${r.id}: ${e.message}`); }
+                }
+                await insertBatch(cycle, docs);
+                recovered += docs.length;
+            }
+        } else if (!ratelimited) {
+            gone++;
+        }
+        const ids = found.map((r) => r.id);
+        console.log(
+            `  ${g.gap_start}–${g.gap_end} (${g.missing} missing): ` +
+            (found.length ? `bonk.io still has ${found.length}${ids.length <= 6 ? ` [${ids.join(", ")}]` : ""}${RECOVER ? " → stored" : ""}` : ratelimited ? "rate-limited" : "gone from bonk.io")
+        );
+        if (ratelimited) {
+            console.log(`\nbonk.io rate-limited us at ID ${resumeFrom}. Wait about an hour and run again.`);
+            break;
+        }
+    }
+
+    console.log(`\nGaps where bonk.io still had replays: ${stillThere}. Gone: ${gone}.` + (RECOVER ? ` Replays recovered: ${recovered}.` : ""));
+    if (!RECOVER && stillThere) console.log("Those can be recovered: rerun with --recover.");
+}
+
+main()
+    .catch((err) => { console.error(err); process.exitCode = 1; })
+    .finally(async () => { await pool.end(); await closeDb(); });

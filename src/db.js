@@ -370,6 +370,10 @@ export async function setScraperStatus(status, waitMs, finishedRun = null) {
  *   } | null
  * }>} docs
  */
+/**
+ * Stores decoded replays. A doc may carry `fetchedAt` (a Date) to record when
+ * it was originally available, used by gap recovery; otherwise it's now.
+ */
 export async function insertBatch(cycle, docs) {
     if (docs.length === 0) return;
 
@@ -381,11 +385,11 @@ export async function insertBatch(cycle, docs) {
 
         for (const doc of docs) {
             const inserted = await client.query(
-                `INSERT INTO replays (cycle, id, mapid, replaydata)
-                 VALUES ($1, $2, $3, $4)
+                `INSERT INTO replays (cycle, id, mapid, replaydata, fetched_at)
+                 VALUES ($1, $2, $3, $4, COALESCE($5::timestamptz, NOW()))
                  ON CONFLICT (cycle, id) DO NOTHING
                  RETURNING id`,
-                [cycle, doc.id, doc.mapid ?? null, doc.replayBytes]
+                [cycle, doc.id, doc.mapid ?? null, doc.replayBytes, doc.fetchedAt ?? null]
             );
 
             // Versioned map upsert — DO NOTHING on conflict since a captured
@@ -426,9 +430,11 @@ export async function insertBatch(cycle, docs) {
                 // stall the live scraper on the same batch indefinitely.
                 const safeLevel = Number.isFinite(p.level) ? p.level : 0;
 
+                // seen_at only moves forward, so a recovered old replay
+                // (doc.fetchedAt in the past) never makes it look newer.
                 await client.query(
                     `INSERT INTO players (username, level, avatars, seen_at)
-                     VALUES ($1, $2, $3::jsonb, NOW())
+                     VALUES ($1, $2, $3::jsonb, COALESCE($4::timestamptz, NOW()))
                      ON CONFLICT (username) DO UPDATE SET
                          level   = GREATEST(players.level, EXCLUDED.level),
                          avatars = (
@@ -437,8 +443,8 @@ export async function insertBatch(cycle, docs) {
                                  players.avatars || EXCLUDED.avatars
                              ) AS elem
                          ),
-                         seen_at = NOW()`,
-                    [p.username, safeLevel, JSON.stringify([p.avatar])]
+                         seen_at = GREATEST(players.seen_at, EXCLUDED.seen_at)`,
+                    [p.username, safeLevel, JSON.stringify([p.avatar]), doc.fetchedAt ?? null]
                 );
 
                 if (inserted.rowCount > 0) {

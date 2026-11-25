@@ -243,18 +243,34 @@ function fmtDuration(ms) {
  * Returns the replays bonk.io still has inside the gap; stops early if
  * bonk.io rate-limits us.
  */
-async function walkGap(g, { all }) {
+async function walkGap(g, { all, onWindow }) {
     const found = new Map();
     for (let end = Math.min(g.gap_start + 9, g.gap_end); ; end = Math.min(end + 10, g.gap_end)) {
         const res = await ask(end);
         if (res.status === "ratelimit") return { found: [...found.values()], ratelimited: true, resumeFrom: end - 9 };
         if (res.status === "ok") {
             // The last window can overlap the one before it; keep each replay once.
-            for (const r of res.replays) if (r.id >= g.gap_start && r.id <= g.gap_end) found.set(r.id, r);
+            const fresh = res.replays.filter((r) => r.id >= g.gap_start && r.id <= g.gap_end && !found.has(r.id));
+            for (const r of fresh) found.set(r.id, r);
+            // Save as we go, so stopping mid-gap keeps what was fetched.
+            if (fresh.length && onWindow) await onWindow(fresh);
         }
         if (!all || end >= g.gap_end) break;
     }
     return { found: [...found.values()], ratelimited: false };
+}
+
+/**
+ * When a recovered replay would have been fetched: spread evenly by ID between
+ * the fetch times of the stored replays either side of its gap. Replays are
+ * uploaded in ID order, so this lands within the gap's window (usually about
+ * an hour), close to what the scraper would have recorded.
+ */
+function estimateFetchedAt(g, id) {
+    const before = new Date(g.before_fetched).getTime();
+    const after = Math.max(before, new Date(g.after_fetched).getTime());
+    const frac = (id - (g.gap_start - 1)) / (g.gap_end + 1 - (g.gap_start - 1));
+    return new Date(before + frac * (after - before));
 }
 
 async function probeGaps(cycle, gaps, big) {
@@ -266,25 +282,26 @@ async function probeGaps(cycle, gaps, big) {
     let requestsLeft = targets.reduce((a, g) => a + requestsFor(g, RECOVER), 0);
     console.log(`\n--- ${RECOVER ? "Recovering" : "Probing"} ${n(targets.length)} gaps on bonk.io (about ${n(requestsLeft)} requests, one every ${REQUEST_GAP_MS / 1000}s) ---`);
     if (RECOVER) {
-        console.log(`Roughly ${fmtDuration(requestsLeft * (REQUEST_GAP_MS + 300))} plus any rate-limit waits. Ctrl-C is safe; rerun to continue.`);
+        console.log(`Roughly ${fmtDuration(requestsLeft * (REQUEST_GAP_MS + 300))} plus any rate-limit waits. Replays are saved as they come in, so Ctrl-C is safe; rerun to continue.`);
         console.log("Each dot is one request. Time left below doesn't count rate-limit waits.");
+        console.log("Recovered replays get a fetched_at between the replays either side of their gap.");
     }
 
     let stillThere = 0, gone = 0, recovered = 0;
     for (let i = 0; i < targets.length; i++) {
         const g = targets[i];
-        const { found, ratelimited, resumeFrom } = await walkGap(g, { all: RECOVER });
+        const store = async (replays) => {
+            const docs = [];
+            for (const r of replays) {
+                try { docs.push({ ...(await buildReplayDoc(r)), fetchedAt: estimateFetchedAt(g, r.id) }); }
+                catch (e) { endDots(); console.warn(`  decode failed for ${r.id}: ${e.message}`); }
+            }
+            await insertBatch(cycle, docs);
+            recovered += docs.length;
+        };
+        const { found, ratelimited, resumeFrom } = await walkGap(g, { all: RECOVER, onWindow: RECOVER ? store : null });
         if (found.length) {
             stillThere++;
-            if (RECOVER) {
-                const docs = [];
-                for (const r of found) {
-                    try { docs.push(await buildReplayDoc(r)); }
-                    catch (e) { console.warn(`  decode failed for ${r.id}: ${e.message}`); }
-                }
-                await insertBatch(cycle, docs);
-                recovered += docs.length;
-            }
         } else if (!ratelimited) {
             gone++;
         }

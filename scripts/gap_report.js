@@ -207,11 +207,33 @@ async function main() {
 // ─── Probe / recover ─────────────────────────────────────────────────────────
 
 /** One request to bonk.io, retried once after a network error. */
+// Progress: requests made and time spent on them (rate-limit waits excluded),
+// for the time-left estimate. A dot per request shows a long gap is moving.
+const stats = { requests: 0, ms: 0, dots: 0 };
+
 async function ask(from) {
+    const t = Date.now();
     let res = await fetchReplays(from);
     if (res.status === "network_error") { await sleep(10_000); res = await fetchReplays(from); }
     await sleep(REQUEST_GAP_MS);
+    stats.requests++;
+    stats.ms += Date.now() - t;
+    process.stdout.write(".");
+    stats.dots++;
     return res;
+}
+
+/** Ends a line of progress dots so the next message starts cleanly. */
+function endDots() {
+    if (stats.dots) process.stdout.write("\n");
+    stats.dots = 0;
+}
+
+const requestsFor = (g, all) => (all ? Math.ceil(g.missing / 10) : 1);
+
+function fmtDuration(ms) {
+    const m = Math.round(ms / 60_000);
+    return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
 
 /**
@@ -222,14 +244,17 @@ async function ask(from) {
  * bonk.io rate-limits us.
  */
 async function walkGap(g, { all }) {
-    const found = [];
+    const found = new Map();
     for (let end = Math.min(g.gap_start + 9, g.gap_end); ; end = Math.min(end + 10, g.gap_end)) {
         const res = await ask(end);
-        if (res.status === "ratelimit") return { found, ratelimited: true, resumeFrom: end - 9 };
-        if (res.status === "ok") found.push(...res.replays.filter((r) => r.id >= g.gap_start && r.id <= g.gap_end));
+        if (res.status === "ratelimit") return { found: [...found.values()], ratelimited: true, resumeFrom: end - 9 };
+        if (res.status === "ok") {
+            // The last window can overlap the one before it; keep each replay once.
+            for (const r of res.replays) if (r.id >= g.gap_start && r.id <= g.gap_end) found.set(r.id, r);
+        }
         if (!all || end >= g.gap_end) break;
     }
-    return { found, ratelimited: false };
+    return { found: [...found.values()], ratelimited: false };
 }
 
 async function probeGaps(cycle, gaps, big) {
@@ -238,8 +263,12 @@ async function probeGaps(cycle, gaps, big) {
     const sample = [...small].sort(() => Math.random() - 0.5).slice(0, Math.min(PROBE, small.length));
     const targets = RECOVER ? [...big, ...small] : [...big.slice(0, PROBE), ...sample];
 
-    console.log(`\n--- ${RECOVER ? "Recovering" : "Probing"} ${n(targets.length)} gaps on bonk.io (one request every ${REQUEST_GAP_MS / 1000}s) ---`);
-    if (RECOVER) console.log("This walks every gap; it can take a while. Ctrl-C is safe, rerun to continue.");
+    let requestsLeft = targets.reduce((a, g) => a + requestsFor(g, RECOVER), 0);
+    console.log(`\n--- ${RECOVER ? "Recovering" : "Probing"} ${n(targets.length)} gaps on bonk.io (about ${n(requestsLeft)} requests, one every ${REQUEST_GAP_MS / 1000}s) ---`);
+    if (RECOVER) {
+        console.log(`Roughly ${fmtDuration(requestsLeft * (REQUEST_GAP_MS + 300))} plus any rate-limit waits. Ctrl-C is safe; rerun to continue.`);
+        console.log("Each dot is one request. Time left below doesn't count rate-limit waits.");
+    }
 
     let stillThere = 0, gone = 0, recovered = 0;
     for (let i = 0; i < targets.length; i++) {
@@ -259,9 +288,14 @@ async function probeGaps(cycle, gaps, big) {
         } else if (!ratelimited) {
             gone++;
         }
+        if (!ratelimited) requestsLeft -= requestsFor(g, RECOVER);
+        const perRequest = stats.requests ? stats.ms / stats.requests : REQUEST_GAP_MS;
+        const progress = `[${n(i + 1)}/${n(targets.length)}]` +
+            (RECOVER ? ` ${n(recovered)} recovered · ~${fmtDuration(requestsLeft * perRequest)} left ·` : "");
+        endDots();
         const ids = found.map((r) => r.id);
         console.log(
-            `  ${g.gap_start}–${g.gap_end} (${g.missing} missing): ` +
+            `${progress} ${g.gap_start}–${g.gap_end} (${g.missing} missing): ` +
             (found.length ? `bonk.io still has ${found.length}${RECOVER ? "" : ` of the first ${Math.min(10, g.missing)}`}${ids.length <= 6 ? ` [${ids.join(", ")}]` : ""}${RECOVER ? " → stored" : ""}` : ratelimited ? "rate-limited" : "gone from bonk.io")
         );
         if (ratelimited) {
@@ -277,6 +311,7 @@ async function probeGaps(cycle, gaps, big) {
         }
     }
 
+    endDots();
     console.log(`\nGaps where bonk.io still had replays: ${stillThere}. Gone: ${gone}.` + (RECOVER ? ` Replays recovered: ${recovered}.` : ""));
     if (!RECOVER && stillThere) console.log("Those can be recovered: rerun with --recover.");
 }

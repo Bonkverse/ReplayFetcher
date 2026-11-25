@@ -26,6 +26,7 @@ jobs:
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - name: Gap report
+        shell: bash   # adds pipefail, so a failed report fails the run
         env:
           DATABASE_URL: ${{ secrets.REPLAY_DB_URL }}
           CYCLE: ${{ inputs.cycle || '6' }}

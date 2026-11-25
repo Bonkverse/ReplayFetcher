@@ -27,7 +27,7 @@ bonk2.io API  ──fetch──►  api.js        (HTTP, typed result union)
 | `avatars` | `hash` → `JSONB` | Each distinct skin once, keyed by a hash ([Skins](#skins)) |
 | `replay_participants.avatar_hash` | `TEXT` | The skin that player wore in that replay |
 | `replay_players` | join table | Many-to-many, indexed on `username` |
-| `scraper_state.position` | `BIGINT` | Survives restarts/redeploys |
+| `scraper_state.position` | `BIGINT` | Highest replay ID stored (the scraper's cursor); on startup the scraper uses `MAX(id)` for the cycle |
 
 **Why BYTEA + gzip instead of storing the original encoded string?**
 
@@ -39,15 +39,25 @@ Result: **40–60% smaller** than the original string, with full round-trip fide
 
 ---
 
+## How the scraper reads bonk.io
+
+bonk.io's `replay_get` returns **up to 10 replays with `id <= startingFrom`, newest first**, and only from about the 1,000 IDs below it. It's not "the next 10 from here". Asking for `308274` returns `308274 … 308265`.
+
+So the scraper keeps a cursor, the highest ID it has stored, and asks for `cursor + 10` to get the IDs just above it. A full window means more may be waiting, so it asks again right away. Otherwise it's caught up and waits 2 minutes. IDs inside a window that weren't there yet are re-checked for 30 minutes. If nothing new turns up for 10 minutes, it looks 500 IDs ahead in case 10+ IDs in a row are missing (see `src/cursor.js`).
+
+Before November 2026 the scraper moved forward by how many replays came back. Whenever more than 10 new replays were waiting, after every rate-limit pause and in busy moments, it only ever got the newest 10. That lost about 56k of cycle 6's 60k missing IDs. `scripts/gap_report.js --recover` fetches them back.
+
+---
+
 ## Resilience
 
 | Scenario | Behaviour |
 |----------|-----------|
 | bonk.io down / timeout | Exponential back-off: 30s → 1min → 2min … up to 30min |
-| Rate-limited (non-success response) | Wait 65 minutes, then retry |
-| Caught up (no new replays) | Wait 5 minutes, then check again |
-| DB insert failure | Don't advance position — retry same batch next iteration |
-| Decode failure on a replay | Log it, skip it, still advance position to avoid infinite loop |
+| Rate-limited (non-success response) | Wait 65 minutes, then carry on from the cursor (nothing is skipped) |
+| Caught up (no new replays) | Re-check IDs that weren't there yet, wait 2 minutes, check again |
+| DB insert failure | Don't advance the cursor — retry the same window next iteration |
+| Decode failure on a replay | Log it, skip it, still advance the cursor to avoid an infinite loop |
 | SIGINT / SIGTERM | Finish current batch, close DB, exit cleanly |
 
 ---
@@ -88,11 +98,11 @@ Railway's log viewer will show lines like:
 
 ```
 [DB] Schema up-to-date.
-[Scraper] Starting from position 12096
-[Scraper] Batch: 10 stored. Position → 12106
-[Scraper] Batch: 10 stored. Position → 12116
-...
-[Scraper] Caught up at position 1382000 — waiting 5 min for new replays
+[Scraper] Resuming — cycle 6, from replay 384819
+[Scraper] Cycle 6 | 10 stored. Up to replay 384828
+[Scraper] Cycle 6 | 7 stored, 1 not there yet (384832). Up to replay 384836
+[Scraper] Caught up at cycle 6, replay 384836 — polling every 2 min
+[Scraper] Caught 1 late replays: 384832
 ```
 
 ---

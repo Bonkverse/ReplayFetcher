@@ -1,0 +1,40 @@
+# Runs scripts/gap_report.js on GitHub's servers, which can reach both the
+# Replay DB (through its public URL) and bonk.io's replay API. The output
+# lands in the run's summary.
+#
+# Needs one repo secret: REPLAY_DB_URL = the Replay DB's DATABASE_PUBLIC_URL
+# (Railway → Replay DB → Variables).
+name: Gap report
+
+on:
+  workflow_dispatch:
+    inputs:
+      cycle:   { description: "Cycle", default: "6" }
+      probe:   { description: "Gaps to check on bonk.io (0 = none)", default: "20" }
+      recover: { description: "Recover the gaps bonk.io still has", type: boolean, default: false }
+  push:
+    branches: [gap-report]
+    paths: [scripts/gap_report.js, .github/workflows/gap-report.yml]
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - name: Gap report
+        shell: bash   # adds pipefail, so a failed report fails the run
+        env:
+          DATABASE_URL: ${{ secrets.REPLAY_DB_URL }}
+          CYCLE: ${{ inputs.cycle || '6' }}
+          PROBE: ${{ inputs.probe || '20' }}
+          RECOVER: ${{ inputs.recover && '--recover' || '' }}
+        run: |
+          node scripts/gap_report.js --cycle "$CYCLE" --probe "$PROBE" $RECOVER --csv gaps.csv | tee report.txt
+          { echo '```'; cat report.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: gap-report, path: "report.txt\ngaps.csv" }

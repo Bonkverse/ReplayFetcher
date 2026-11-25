@@ -274,6 +274,15 @@ export async function getState() {
 }
 
 /**
+ * Highest replay ID stored for a cycle, or null if it has none. The scraper
+ * resumes from here (see cursor.js).
+ */
+export async function maxStoredId(cycle) {
+    const res = await pool.query(`SELECT MAX(id) AS max FROM replays WHERE cycle = $1`, [cycle]);
+    return res.rows[0].max == null ? null : Number(res.rows[0].max);
+}
+
+/**
  * Atomically saves the current cycle + position.
  * Called after every successful batch so the scraper can always resume cleanly.
  */

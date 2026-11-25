@@ -37,6 +37,8 @@ export const config = {
         caughtUp:        2 * 60_000,     // poll interval when fully caught up
         initialBackoff: 30_000,          // first retry delay on network error
         maxBackoff:     30 * 60_000,     // cap for exponential back-off
+        holeTtl:        30 * 60_000,     // keep re-checking a missed replay ID this long
+        stall:          10 * 60_000,     // no new replays this long → look past missing IDs
     },
 
     // ── Scraper start position ────────────────────────────────────────────────

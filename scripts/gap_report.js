@@ -36,7 +36,7 @@ const TOP = parseInt(opt("top", "40"), 10);
 const CSV = opt("csv", null);
 const RECOVER = opt("recover", false) === true;
 const PROBE = RECOVER ? parseInt(opt("probe", "1000000"), 10) || 1_000_000 : parseInt(opt("probe", "0"), 10) || 0;
-const REQUEST_GAP_MS = 4_000;
+const REQUEST_GAP_MS = Number(process.env.GAP_REQUEST_MS ?? 4_000);
 
 if (!process.env.DATABASE_URL) {
     console.error("Set DATABASE_URL to the Replay DB's public URL (Railway → Replay DB → Variables → DATABASE_PUBLIC_URL).");
@@ -64,13 +64,15 @@ function table(rows, cols) {
 /**
  * Best guess at why a gap happened, from when its neighbours were fetched.
  * `fetched_at` is when the scraper stored a replay, not when it was uploaded.
+ * The first two are the old scraper bug (it only got the newest 10 replays
+ * whenever more were waiting), fixed in the scraper's cursor rewrite.
  */
 function likelyCause(g) {
     const m = g.mins_between;
     if (m == null) return "";
-    if (m >= 55) return "scraper paused or down (rate limit / outage / deploy)";
-    if (m <= 3) return "bonk.io didn't return these IDs (fetched in one go)";
-    return "skipped near the newest replays";
+    if (m >= 55) return "missed after a rate-limit pause / outage";
+    if (m <= 3) return "bonk.io didn't have these IDs (often normal)";
+    return "missed between polls (10+ new at once)";
 }
 
 // ─── Queries ─────────────────────────────────────────────────────────────────
@@ -213,21 +215,19 @@ async function ask(from) {
 }
 
 /**
- * Walks one gap through bonk.io's API. Returns the replays bonk.io still has
- * inside it. Stops early if bonk.io rate-limits us.
+ * Walks one gap through bonk.io's API. Asking for N returns up to 10 replays
+ * with id <= N (newest first), so a gap is read in windows ending at
+ * start+9, start+19, … A probe only reads the first window.
+ * Returns the replays bonk.io still has inside the gap; stops early if
+ * bonk.io rate-limits us.
  */
 async function walkGap(g, { all }) {
     const found = [];
-    let from = g.gap_start;
-    while (from <= g.gap_end) {
-        const res = await ask(from);
-        if (res.status === "ratelimit") return { found, ratelimited: true, resumeFrom: from };
-        if (res.status !== "ok") break;
-        const ids = res.replays.map((r) => r.id);
-        found.push(...res.replays.filter((r) => r.id >= g.gap_start && r.id <= g.gap_end));
-        const max = Math.max(...ids);
-        if (!all || max > g.gap_end) break;          // a probe needs one request; past the gap
-        from = max + 1;
+    for (let end = Math.min(g.gap_start + 9, g.gap_end); ; end = Math.min(end + 10, g.gap_end)) {
+        const res = await ask(end);
+        if (res.status === "ratelimit") return { found, ratelimited: true, resumeFrom: end - 9 };
+        if (res.status === "ok") found.push(...res.replays.filter((r) => r.id >= g.gap_start && r.id <= g.gap_end));
+        if (!all || end >= g.gap_end) break;
     }
     return { found, ratelimited: false };
 }
@@ -242,7 +242,8 @@ async function probeGaps(cycle, gaps, big) {
     if (RECOVER) console.log("This walks every gap; it can take a while. Ctrl-C is safe, rerun to continue.");
 
     let stillThere = 0, gone = 0, recovered = 0;
-    for (const g of targets) {
+    for (let i = 0; i < targets.length; i++) {
+        const g = targets[i];
         const { found, ratelimited, resumeFrom } = await walkGap(g, { all: RECOVER });
         if (found.length) {
             stillThere++;
@@ -261,11 +262,18 @@ async function probeGaps(cycle, gaps, big) {
         const ids = found.map((r) => r.id);
         console.log(
             `  ${g.gap_start}–${g.gap_end} (${g.missing} missing): ` +
-            (found.length ? `bonk.io still has ${found.length}${ids.length <= 6 ? ` [${ids.join(", ")}]` : ""}${RECOVER ? " → stored" : ""}` : ratelimited ? "rate-limited" : "gone from bonk.io")
+            (found.length ? `bonk.io still has ${found.length}${RECOVER ? "" : ` of the first ${Math.min(10, g.missing)}`}${ids.length <= 6 ? ` [${ids.join(", ")}]` : ""}${RECOVER ? " → stored" : ""}` : ratelimited ? "rate-limited" : "gone from bonk.io")
         );
         if (ratelimited) {
-            console.log(`\nbonk.io rate-limited us at ID ${resumeFrom}. Wait about an hour and run again.`);
-            break;
+            if (!RECOVER) {
+                console.log(`\nbonk.io rate-limited us at ID ${resumeFrom}. Wait about an hour and run again.`);
+                break;
+            }
+            // Recovery is long; wait it out and carry on. Rerunning also resumes,
+            // since the gaps are re-read from the database.
+            console.log(`  rate-limited at ID ${resumeFrom}; waiting 65 min, then retrying this gap (Ctrl-C is safe)…`);
+            await sleep(65 * 60_000);
+            i--;
         }
     }
 

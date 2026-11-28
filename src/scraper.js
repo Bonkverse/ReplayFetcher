@@ -12,6 +12,8 @@ const HOLE_REQUESTS_PER_POLL = 3;
 // After config.delays.stall with nothing new, look this far ahead in case 10+
 // IDs in a row are missing and newer replays sit past them.
 const LOOKAHEAD = 500;
+// How far back bonk.io looks from the number asked (roughly; see cursor.js).
+const LOOKBACK = 1000;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -24,45 +26,12 @@ function clamp(val, min, max) {
 }
 
 // ─── Cycle-reset detection ────────────────────────────────────────────────────
-
-/**
- * Returns true if the returned replay IDs indicate a new cycle has started.
- *
- * How it works:
- *   After being caught up, the next successful batch should have IDs just above
- *   our current position. If instead the max returned ID is tiny relative to
- *   our position, Chaz wiped the DB and the IDs have reset.
- *
- * Example: position = 1 400 000, threshold = 0.01 (1%)
- *   → maxReturnedId must be < 14 000 to trigger a cycle reset.
- *
- * We only check this AFTER being caught up (wasCaughtUp = true) because during
- * normal scraping the returned IDs will always be near our position. The
- * caught-up gate prevents false positives early in a cycle when our position
- * is still low.
- *
- * @param {number[]} returnedIds   IDs in the API response batch.
- * @param {number}   position      Current scraper position before this batch.
- * @param {boolean}  wasCaughtUp   Whether we were in caught-up state last iteration.
- */
-function isCycleReset(returnedIds, position, wasCaughtUp) {
-    if (!wasCaughtUp) return false;
-    if (position < 1000) return false; // Too early in a cycle to have meaningful signal.
-
-    const maxId = Math.max(...returnedIds);
-    const isReset = maxId < position * config.cycleResetThreshold;
-
-    if (isReset) {
-        console.log(
-            `[Cycle] Reset detected: position was ${position}, ` +
-            `but new batch max ID is ${maxId} ` +
-            `(${((maxId / position) * 100).toFixed(3)}% of position, ` +
-            `threshold: ${config.cycleResetThreshold * 100}%)`
-        );
-    }
-
-    return isReset;
-}
+//
+// A cycle ends when bonk.io wipes its replays and starts numbering from 1
+// again. bonk.io only returns replays at or below the number you ask for (from
+// the ~1,000 below it), so after a wipe the scraper's requests (highest stored
+// + 10) just come back empty and it looks caught up forever. wasWiped() checks
+// for that directly when nothing new has arrived for a while.
 
 /** Decodes replays for storage; ones that fail are logged and skipped. */
 async function decodeAll(replays) {
@@ -112,11 +81,12 @@ export class Scraper {
         let runAdded         = 0;            // replays stored in the current fetch run
         let lastNewAt        = Date.now();
         let newerExists      = false;        // a run of missing IDs with replays past it
+        let lastResetCheck   = 0;            // when we last checked for a wipe
         const holes          = new Map();    // replay id → { at: first missed, checks }
 
         console.log(
             `[Scraper] Resuming — cycle ${cycle}, from replay ${cursor + 1}` +
-            (stored != null && stored + 1 !== position ? ` (saved position was ${position})` : "")
+            (stored != null && stored !== position ? ` (saved position was ${position})` : "")
         );
 
         // Nothing new right now: re-check missed IDs, then wait for the next poll.
@@ -175,22 +145,26 @@ export class Scraper {
             const replays     = result.status === "ok" ? result.replays : [];
             const returnedIds = replays.map((r) => r.id);
 
-            // ── Cycle-reset check ─────────────────────────────────────────────
-            if (replays.length && isCycleReset(returnedIds, cursor, wasCaughtUp)) {
-                ({ cycle, position } = await beginNewCycle(cycle));
-                cursor = position - 1;
-                holes.clear();
-                wasCaughtUp = false;
-                console.log(`[Scraper] Now on cycle ${cycle} — restarting from replay ${cursor + 1}`);
-                // Don't process this batch under the old cycle — loop again
-                // from the new position so the fetch is clean.
-                continue;
-            }
-
             const step = advance(cursor, returnedIds);
 
             // ── Nothing new ───────────────────────────────────────────────────
             if (!step.fresh.length) {
+                // Quiet for a long time: check whether bonk.io wiped its
+                // replays and started a new cycle.
+                const now = Date.now();
+                if (now - lastNewAt > config.delays.resetCheck && now - lastResetCheck > config.delays.resetCheck) {
+                    lastResetCheck = now;
+                    if (await this.#wasWiped(cursor)) {
+                        ({ cycle, position } = await beginNewCycle(cycle));
+                        cursor = position - 1;
+                        holes.clear();
+                        wasCaughtUp = false;
+                        newerExists = false;
+                        lastNewAt = Date.now();
+                        console.log(`[Scraper] Now on cycle ${cycle} — starting from replay ${cursor + 1}`);
+                        continue;
+                    }
+                }
                 // Been quiet a while: maybe 10+ IDs in a row are missing and
                 // newer replays sit past them. If so, step over this block.
                 if (!newerExists && Date.now() - lastNewAt > config.delays.stall) {
@@ -293,6 +267,50 @@ export class Scraper {
             await sleep(config.delays.between);
         }
         return { added, rateLimited: false };
+    }
+
+    /**
+     * True if bonk.io has wiped its replays (a new cycle has started).
+     *
+     * In a normal cycle, asking for our newest stored replay always returns it
+     * (and the ones below it). After a wipe it returns nothing. To tell a wipe
+     * from bonk.io having trouble, bonk.io must also be serving low IDs (the
+     * new cycle's first replays), and the newest replay must still be missing
+     * when we ask again a minute later.
+     */
+    async #wasWiped(cursor) {
+        // bonk.io looks ~1,000 IDs back from the number asked, so below that
+        // the new cycle's low IDs would still come back and hide a wipe.
+        if (cursor < LOOKBACK) return false;
+        const ask = async (startingFrom) => {
+            const res = await fetchReplays(startingFrom);
+            await sleep(config.delays.between);
+            return res;
+        };
+
+        // Gone = nothing came back from the ~1,000 IDs at or below our newest.
+        const gone = (res) =>
+            res.status === "caught_up" ||
+            (res.status === "ok" && res.replays.every((r) => r.id <= cursor - LOOKBACK));
+
+        const newest = await ask(cursor);
+        if (!gone(newest)) return false;                     // still there, or an error
+
+        const low = await ask(BATCH);
+        if (low.status !== "ok" || !low.replays.length) {
+            console.warn(`[Cycle] Replay ${cursor} is gone from bonk.io, but it isn't serving new replays yet — checking again later`);
+            return false;
+        }
+
+        await sleep(config.delays.resetConfirm);
+        const again = await ask(cursor);
+        if (!gone(again)) return false;
+
+        console.log(
+            `[Cycle] bonk.io wiped its replays: replay ${cursor} is gone and it now serves ` +
+            `${low.replays.map((r) => r.id).sort((a, b) => a - b).join(", ")}`
+        );
+        return true;
     }
 
     /** True if bonk.io has replays well past `cursor` (we're stuck behind missing IDs). */

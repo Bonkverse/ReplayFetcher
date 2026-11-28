@@ -20,15 +20,10 @@ export const config = {
 
     // ── Cycle-reset detection ─────────────────────────────────────────────────
     //
-    // After we're caught up, if the next successful batch's max ID is less than
-    // (our current position × this threshold), we treat it as a new cycle.
-    //
-    // Example: position = 1 400 000, threshold = 0.01
-    //   → any batch whose max ID < 14 000 is flagged as a reset.
-    //
-    // 0.01 (1%) is conservative: even if Chaz starts the new cycle at ID 50 000
-    // it would still be far below 1% of a mature cycle's position.
-    cycleResetThreshold: parseFloat(process.env.CYCLE_RESET_THRESHOLD ?? "0.01"),
+    // See wasWiped() in src/scraper.js. After delays.resetCheck with no new
+    // replays, the scraper asks bonk.io for the newest replay it has stored.
+    // If that's gone (and bonk.io is serving low IDs), the replays were wiped
+    // and a new cycle has started.
 
     // ── Rate-limiting & delays (all in ms) ───────────────────────────────────
     delays: {
@@ -39,6 +34,8 @@ export const config = {
         maxBackoff:     30 * 60_000,     // cap for exponential back-off
         holeTtl:        30 * 60_000,     // keep re-checking a missed replay ID this long
         stall:          10 * 60_000,     // no new replays this long → look past missing IDs
+        resetCheck:     30 * 60_000,     // no new replays this long → check for a wipe (at most this often)
+        resetConfirm:   60_000,          // wait before re-checking a suspected wipe
     },
 
     // ── Scraper start position ────────────────────────────────────────────────

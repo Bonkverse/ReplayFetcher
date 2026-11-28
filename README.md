@@ -121,16 +121,19 @@ node --env-file=.env src/index.js
 
 ## Starting a new replay cycle
 
-When Chaz wipes replays and a new cycle begins:
+This is automatic. When Chaz wipes replays, bonk.io starts numbering from 1 again, and the scraper's requests (highest stored + 10) start coming back empty. After 30 minutes with no new replays, it checks for a wipe (at most once every 30 minutes):
 
-1. Find the first ID of the new cycle (visible in the API response or bonkverse).
-2. In Railway → Variables, update `START_POSITION` to that ID.
-3. In Railway → Postgres, run:
-   ```sql
-   UPDATE scraper_state SET position = <new_start_id> WHERE id = 1;
-   ```
-   (Or just truncate all tables and let the scraper recreate the state row.)
-4. Redeploy.
+1. It asks bonk.io for the newest replay it has stored. In a normal cycle that's always there.
+2. If that's gone, it asks for replay 10. If bonk.io is serving replays there, it's alive and on a new cycle.
+3. A minute later it checks the newest stored replay once more. Still gone means a wipe: it logs `[Cycle] bonk.io wiped its replays …`, moves to the next cycle and starts from replay 1.
+
+If bonk.io is down or not serving the new cycle's replays yet, it doesn't switch; it checks again 30 minutes later.
+
+To switch by hand (say a new cycle starts far above 1), run this and restart the service. The scraper reads the highest stored ID for the cycle, so `position` is only used while the new cycle is empty:
+
+```sql
+UPDATE scraper_state SET cycle = <new cycle>, position = <first ID of the new cycle> WHERE id = 1;
+```
 
 ---
 

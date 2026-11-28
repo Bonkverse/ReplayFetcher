@@ -247,7 +247,7 @@ async function walkGap(g, { all, onWindow }) {
     const found = new Map();
     for (let end = Math.min(g.gap_start + 9, g.gap_end); ; end = Math.min(end + 10, g.gap_end)) {
         const res = await ask(end);
-        if (res.status === "ratelimit") return { found: [...found.values()], ratelimited: true, resumeFrom: end - 9 };
+        if (res.status === "ratelimit") return { found: [...found.values()], ratelimited: true, resumeFrom: Math.max(g.gap_start, end - 9) };
         if (res.status === "ok") {
             // The last window can overlap the one before it; keep each replay once.
             const fresh = res.replays.filter((r) => r.id >= g.gap_start && r.id <= g.gap_end && !found.has(r.id));
